@@ -1,0 +1,206 @@
+opencollection: 1.0.0
+info:
+  name: Patreon Nightcore
+config:
+  proxy:
+    inherit: true
+    config:
+      protocol: http
+      hostname: ""
+      port: ""
+      auth:
+        username: ""
+        password: ""
+      bypassProxy: ""
+items:
+  - info:
+      name: Root welcome
+      type: http
+      seq: 1
+    http:
+      method: GET
+      url: http://localhost:8000/
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: OAuth login - exchange code
+      type: http
+      seq: 2
+    http:
+      method: GET
+      url: http://localhost:8000/login
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+      params:
+        - name: code
+          value: "{{PATREON_AUTH_CODE}}"
+          type: query
+        - name: redirectUri
+          value: "{{PATREON_REDIRECT_URI}}"
+          type: query
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: Identity - bearer token
+      type: http
+      seq: 3
+    http:
+      method: GET
+      url: http://localhost:8000/identity
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+        - name: Authorization
+          value: Bearer {{PATREON_ACCESS_TOKEN}}
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: Patron - active membership check
+      type: http
+      seq: 4
+    http:
+      method: GET
+      url: http://localhost:8000/patron
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+        - name: Authorization
+          value: Bearer {{PATREON_ACCESS_TOKEN}}
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: CORS preflight - allowed origin
+      type: http
+      seq: 5
+    http:
+      method: OPTIONS
+      url: http://localhost:8000/patron
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+        - name: Access-Control-Request-Method
+          value: GET
+        - name: Access-Control-Request-Headers
+          value: authorization
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: CORS negative - disallowed origin
+      type: http
+      seq: 6
+    http:
+      method: GET
+      url: http://localhost:8000/
+      headers:
+        - name: Origin
+          value: http://evil.test
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: Login negative - missing code
+      type: http
+      seq: 7
+    http:
+      method: GET
+      url: http://localhost:8000/login
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+      params:
+        - name: redirectUri
+          value: "{{PATREON_REDIRECT_URI}}"
+          type: query
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+
+  - info:
+      name: Login negative - malformed percent encoding
+      type: http
+      seq: 8
+    http:
+      method: GET
+      url: http://localhost:8000/login?code=abc%ZZ&redirectUri=http%3A%2F%2Flocalhost%3A1337%2Fcb
+      headers:
+        - name: Origin
+          value: http://localhost:1337
+      auth: inherit
+    settings:
+      encodeUrl: false
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+  - info:
+      name: CORS preflight - localhost:3000 (dev)
+      type: http
+      seq: 9
+    http:
+      method: OPTIONS
+      url: http://localhost:8000/identity
+      headers:
+        - name: Origin
+          value: http://localhost:3000
+        - name: Access-Control-Request-Method
+          value: GET
+        - name: Access-Control-Request-Headers
+          value: authorization
+      auth: inherit
+    settings:
+      encodeUrl: true
+      timeout: 0
+      followRedirects: true
+      maxRedirects: 5
+      forwardAuthorizationHeader: false
+bundled: true
+extensions:
+  bruno:
+    ignore:
+      - node_modules
+      - .git
+    exportedAt: "2026-10-12T14:15:42.476Z"
+    exportedUsing: Bruno
