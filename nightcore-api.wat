@@ -205,6 +205,9 @@
   (global $L_active i32 (i32.const 31))
 
   ;; ---- state ----
+  ;; Bump allocator cursor. Reset to 65536 at the start of every request.
+  ;; Fixed buffers below 0xC000 (form/query/auth/origin/Patreon body) are immortal;
+  ;; cached env secrets live at 0xC000/0xC200 so heap reset cannot clobber them.
   (global $heap (mut i32) (i32.const 65536))
   (global $origin_ptr (mut i32) (i32.const 0))
   (global $origin_len (mut i32) (i32.const 0))
@@ -212,6 +215,11 @@
   (global $auth_len (mut i32) (i32.const 0))
   (global $env_ptr (mut i32) (i32.const 0))
   (global $env_n (mut i32) (i32.const 0))
+  ;; One-shot env cache: PATREON_CLIENT_ID @ 0xC000, SECRET @ 0xC200 (max 512 each).
+  (global $env_ready (mut i32) (i32.const 0))
+  (global $cid_len (mut i32) (i32.const 0))
+  (global $csec_len (mut i32) (i32.const 0))
+  (global $mock_active (mut i32) (i32.const 0))
   (global $resp_len (mut i32) (i32.const 0))
   (global $r_status (mut i32) (i32.const 404))
   (global $r_ptr (mut i32) (i32.const 0))
@@ -315,6 +323,36 @@
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $l)))
     (i32.const 0) (i32.const 0))
+
+  ;; Lift process.env once, copy secrets into fixed immortal slots, then forget the
+  ;; bump-allocated env table (it will be overwritten when $heap resets next request).
+  (func $ensure_env
+    (local $ptr i32) (local $len i32)
+    (if (global.get $env_ready) (then (return)))
+    (call $get_environment (i32.const 0x108))
+    (global.set $env_ptr (i32.load (i32.const 0x108)))
+    (global.set $env_n (i32.load (i32.const 0x10c)))
+    (call $getenv (global.get $S_e_client_id) (global.get $L_e_client_id))
+    (local.set $len) (local.set $ptr)
+    (if (i32.and (i32.ne (local.get $ptr) (i32.const 0)) (i32.le_u (local.get $len) (i32.const 512)))
+      (then
+        (memory.copy (i32.const 0xC000) (local.get $ptr) (local.get $len))
+        (global.set $cid_len (local.get $len)))
+      (else (global.set $cid_len (i32.const 0))))
+    (call $getenv (global.get $S_e_client_secret) (global.get $L_e_client_secret))
+    (local.set $len) (local.set $ptr)
+    (if (i32.and (i32.ne (local.get $ptr) (i32.const 0)) (i32.le_u (local.get $len) (i32.const 512)))
+      (then
+        (memory.copy (i32.const 0xC200) (local.get $ptr) (local.get $len))
+        (global.set $csec_len (local.get $len)))
+      (else (global.set $csec_len (i32.const 0))))
+    (call $getenv (global.get $S_e_mock_active) (global.get $L_e_mock_active))
+    (local.set $len) (local.set $ptr)
+    (global.set $mock_active
+      (i32.and (i32.ne (local.get $ptr) (i32.const 0)) (i32.ne (local.get $len) (i32.const 0))))
+    (global.set $env_ptr (i32.const 0))
+    (global.set $env_n (i32.const 0))
+    (global.set $env_ready (i32.const 1)))
 
   (func $reply (param $status i32) (param $ptr i32) (param $len i32) (param $json i32)
     (global.set $r_status (local.get $status))
@@ -500,17 +538,16 @@
   ;; ======================= route handlers =======================
 
   (func $do_login (param $path i32) (param $len i32)
-    (local $code_len i32) (local $redir_len i32) (local $id_ptr i32) (local $id_len i32) (local $sec_ptr i32) (local $sec_len i32)
+    (local $code_len i32) (local $redir_len i32) (local $id_len i32) (local $sec_len i32)
     (local $d i32) (local $st i32)
     (local.set $code_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_code) (global.get $L_q_code) (i32.const 0x3000)))
     (local.set $redir_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_redirect) (global.get $L_q_redirect) (i32.const 0x3400)))
     (if (i32.or (i32.lt_s (local.get $code_len) (i32.const 0)) (i32.lt_s (local.get $redir_len) (i32.const 0)))
       (then (return (call $reply (i32.const 400) (global.get $S_badreq) (global.get $L_badreq) (i32.const 1)))))
-    (call $getenv (global.get $S_e_client_id) (global.get $L_e_client_id))
-    (local.set $id_len) (local.set $id_ptr)
-    (call $getenv (global.get $S_e_client_secret) (global.get $L_e_client_secret))
-    (local.set $sec_len) (local.set $sec_ptr)
-    (if (i32.or (i32.eqz (local.get $id_ptr)) (i32.eqz (local.get $sec_ptr)))
+    (call $ensure_env)
+    (local.set $id_len (global.get $cid_len))
+    (local.set $sec_len (global.get $csec_len))
+    (if (i32.or (i32.eqz (local.get $id_len)) (i32.eqz (local.get $sec_len)))
       (then (return (call $reply (i32.const 500) (global.get $S_err_env) (global.get $L_err_env) (i32.const 1)))))
 
     (local.set $d (call $put (i32.const 0x2000) (global.get $S_f_code) (global.get $L_f_code)))
@@ -518,9 +555,9 @@
     (local.set $d (call $put (local.get $d) (global.get $S_f_redirect) (global.get $L_f_redirect)))
     (local.set $d (call $form_enc (local.get $d) (i32.const 0x3400) (local.get $redir_len)))
     (local.set $d (call $put (local.get $d) (global.get $S_f_grant) (global.get $L_f_grant)))
-    (local.set $d (call $form_enc (local.get $d) (local.get $id_ptr) (local.get $id_len)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC000) (local.get $id_len)))
     (local.set $d (call $put (local.get $d) (global.get $S_f_secret) (global.get $L_f_secret)))
-    (local.set $d (call $form_enc (local.get $d) (local.get $sec_ptr) (local.get $sec_len)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC200) (local.get $sec_len)))
 
     (local.set $st (call $patreon_req (i32.const 2) (global.get $S_p_token) (global.get $L_p_token)
       (i32.const 0x2000) (i32.sub (local.get $d) (i32.const 0x2000)) (i32.const 1) (i32.const 0)))
@@ -537,10 +574,9 @@
     (call $reply (local.get $st) (i32.const 0x4000) (global.get $resp_len) (i32.const 1)))
 
   (func $do_patron
-    (local $st i32) (local $mock_ptr i32) (local $mock_len i32)
-    (call $getenv (global.get $S_e_mock_active) (global.get $L_e_mock_active))
-    (local.set $mock_len) (local.set $mock_ptr)
-    (if (i32.and (i32.ne (local.get $mock_ptr) (i32.const 0)) (i32.ne (local.get $mock_len) (i32.const 0)))
+    (local $st i32)
+    (call $ensure_env)
+    (if (global.get $mock_active)
       (then (return (call $reply (i32.const 204) (i32.const 0) (i32.const 0) (i32.const 0)))))
     (local.set $st (call $patreon_req (i32.const 0) (global.get $S_p_patron) (global.get $L_p_patron)
       (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1)))
@@ -557,6 +593,10 @@
     (local $path i32) (local $len i32) (local $method i32)
     (local $resp i32) (local $fields i32) (local $body i32) (local $stream i32)
 
+    ;; Reclaim all bump-allocated ABI lifts from the previous request (path strings,
+    ;; header list temps, env table leftovers, Patreon body chunks, etc.).
+    (global.set $heap (i32.const 65536))
+
     (call $req_method (local.get $req) (i32.const 32))
     (local.set $method (i32.load8_u (i32.const 32)))
 
@@ -572,9 +612,7 @@
     (if (global.get $auth_len) (then (global.set $auth_ptr (i32.const 0x3000))) (else (global.set $auth_ptr (i32.const 0))))
     (call $req_drop (local.get $req))
 
-    (call $get_environment (i32.const 0x108))
-    (global.set $env_ptr (i32.load (i32.const 0x108)))
-    (global.set $env_n (i32.load (i32.const 0x10c)))
+    ;; Env is loaded lazily via $ensure_env from /login and /patron only.
 
     (call $reply (i32.const 404) (global.get $S_notfound) (global.get $L_notfound) (i32.const 0))
     (if (i32.eq (local.get $method) (i32.const 6))
