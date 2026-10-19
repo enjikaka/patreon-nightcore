@@ -213,8 +213,8 @@
   ;; scratch regions are process-global. Overlapping handle() calls on the SAME
   ;; instance would race. Production ENTRYPOINT pins
   ;; --max-instance-concurrent-reuse-count=1 (WASIp2 default; cannot be >1 for
-  ;; p2). Serial reuse across requests is OK because heap is reset and env
-  ;; secrets live in immortal fixed slots.
+  ;; p2). Serial reuse across requests is OK because heap is reset, request
+  ;; scratch is wiped at handle entry, and env secrets live in immortal slots.
   (global $heap (mut i32) (i32.const 65536))
   (global $origin_ptr (mut i32) (i32.const 0))
   (global $origin_len (mut i32) (i32.const 0))
@@ -481,7 +481,11 @@
         (call $fields_append (local.get $fields)
           (global.get $S_h_ct) (global.get $L_h_ct)
           (global.get $S_ct_form) (global.get $L_ct_form) (i32.const 0x40))))
-    (if (i32.and (local.get $auth) (i32.ne (global.get $auth_ptr) (i32.const 0)))
+    ;; Forward Authorization only when THIS request copied a non-empty value.
+    ;; Never trust leftover bytes in 0x3000 without both ptr and len set.
+    (if (i32.and (local.get $auth)
+          (i32.and (i32.ne (global.get $auth_ptr) (i32.const 0))
+                   (i32.ne (global.get $auth_len) (i32.const 0))))
       (then
         (call $fields_append (local.get $fields)
           (global.get $S_h_auth) (global.get $L_h_auth)
@@ -603,6 +607,21 @@
     ;; Reclaim all bump-allocated ABI lifts from the previous request (path strings,
     ;; header list temps, env table leftovers, Patreon body chunks, etc.).
     (global.set $heap (i32.const 65536))
+
+    ;; Wipe request-scoped fixed scratch so a reused instance cannot retain the
+    ;; previous caller's Authorization, Origin, OAuth query, form body (includes
+    ;; client secret), or Patreon JSON. Env cache at 0xC000+ is intentionally kept.
+    ;; JS analogy: Object.assign(scratch, zeros) + reset length fields before parse.
+    (memory.fill (i32.const 0x2000) (i32.const 0) (i32.const 40960)) ;; 0x2000..0xC000
+    (global.set $origin_ptr (i32.const 0))
+    (global.set $origin_len (i32.const 0))
+    (global.set $auth_ptr (i32.const 0))
+    (global.set $auth_len (i32.const 0))
+    (global.set $resp_len (i32.const 0))
+    (global.set $r_status (i32.const 404))
+    (global.set $r_ptr (i32.const 0))
+    (global.set $r_len (i32.const 0))
+    (global.set $r_json (i32.const 0))
 
     (call $req_method (local.get $req) (i32.const 32))
     (local.set $method (i32.load8_u (i32.const 32)))
