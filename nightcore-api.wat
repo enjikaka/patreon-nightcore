@@ -367,8 +367,11 @@
     (global.set $r_len (local.get $len))
     (global.set $r_json (local.get $json)))
 
-  ;; Extract query parameter into decoded buffer. Returns decoded len, or -1 when absent/malformed.
-  (func $query_decode (param $path i32) (param $plen i32) (param $name i32) (param $nlen i32) (param $dst i32) (result i32)
+  ;; Extract query parameter into decoded buffer.
+  ;; Returns decoded len, or -1 when absent/malformed/exceeds $max.
+  ;; $max is required: unbounded decode could smash adjacent fixed slots
+  ;; (origin @ 0x3800, Patreon body @ 0x4000, env cache @ 0xC000) under /login.
+  (func $query_decode (param $path i32) (param $plen i32) (param $name i32) (param $nlen i32) (param $dst i32) (param $max i32) (result i32)
     (local $q i32) (local $p i32) (local $end i32) (local $ks i32) (local $ke i32) (local $vs i32) (local $ve i32) (local $d i32) (local $c i32) (local $h1 i32) (local $h2 i32)
     (local.set $end (i32.add (local.get $path) (local.get $plen)))
     (local.set $q (local.get $path))
@@ -409,6 +412,9 @@
           (local.set $p (local.get $vs))
           (loop $dec
             (if (i32.ge_u (local.get $p) (local.get $ve)) (then (return (i32.sub (local.get $d) (local.get $dst)))))
+            ;; Reject before writing when decoded output would exceed the slot.
+            (if (i32.ge_u (i32.sub (local.get $d) (local.get $dst)) (local.get $max))
+              (then (return (i32.const -1))))
             (local.set $c (i32.load8_u (local.get $p)))
             (if (i32.eq (local.get $c) (i32.const 0x2b))
               (then (i32.store8 (local.get $d) (i32.const 0x20)) (local.set $d (i32.add (local.get $d) (i32.const 1))) (local.set $p (i32.add (local.get $p) (i32.const 1))) (br $dec)))
@@ -438,8 +444,11 @@
       (br $params))
     (i32.const -1))
 
-  (func $form_enc (param $dst i32) (param $src i32) (param $len i32) (result i32)
-    (local $i i32) (local $c i32) (local $hi i32) (local $lo i32)
+  ;; URL-form-encode $src into $dst, never writing at or past $lim.
+  ;; Returns next dst, or 0 on overflow (callers must treat 0 as hard failure).
+  (func $form_enc (param $dst i32) (param $src i32) (param $len i32) (param $lim i32) (result i32)
+    (local $i i32) (local $c i32) (local $hi i32) (local $lo i32) (local $need i32)
+    (if (i32.eqz (local.get $dst)) (then (return (i32.const 0))))
     (loop $l
       (if (i32.ge_u (local.get $i) (local.get $len)) (then (return (local.get $dst))))
       (local.set $c (i32.load8_u (i32.add (local.get $src) (local.get $i))))
@@ -447,20 +456,37 @@
                          (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))))
                   (i32.or (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122)))
                           (i32.or (i32.eq (local.get $c) (i32.const 45)) (i32.or (i32.eq (local.get $c) (i32.const 46)) (i32.or (i32.eq (local.get $c) (i32.const 95)) (i32.eq (local.get $c) (i32.const 42)))))))
-        (then (i32.store8 (local.get $dst) (local.get $c)) (local.set $dst (i32.add (local.get $dst) (i32.const 1))))
+        (then (local.set $need (i32.const 1)))
         (else
           (if (i32.eq (local.get $c) (i32.const 32))
-            (then (i32.store8 (local.get $dst) (i32.const 43)) (local.set $dst (i32.add (local.get $dst) (i32.const 1))))
-            (else
-              (local.set $hi (i32.shr_u (local.get $c) (i32.const 4)))
-              (local.set $lo (i32.and (local.get $c) (i32.const 15)))
-              (i32.store8 (local.get $dst) (i32.const 37))
-              (i32.store8 (i32.add (local.get $dst) (i32.const 1)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $hi) (i32.const 9))) (local.get $hi)))
-              (i32.store8 (i32.add (local.get $dst) (i32.const 2)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $lo) (i32.const 9))) (local.get $lo)))
-              (local.set $dst (i32.add (local.get $dst) (i32.const 3)))))))
+            (then (local.set $need (i32.const 1)))
+            (else (local.set $need (i32.const 3))))))
+      (if (i32.gt_u (i32.add (local.get $dst) (local.get $need)) (local.get $lim))
+        (then (return (i32.const 0))))
+      (if (i32.eq (local.get $need) (i32.const 1))
+        (then
+          (if (i32.eq (local.get $c) (i32.const 32))
+            (then (i32.store8 (local.get $dst) (i32.const 43)))
+            (else (i32.store8 (local.get $dst) (local.get $c))))
+          (local.set $dst (i32.add (local.get $dst) (i32.const 1))))
+        (else
+          (local.set $hi (i32.shr_u (local.get $c) (i32.const 4)))
+          (local.set $lo (i32.and (local.get $c) (i32.const 15)))
+          (i32.store8 (local.get $dst) (i32.const 37))
+          (i32.store8 (i32.add (local.get $dst) (i32.const 1)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $hi) (i32.const 9))) (local.get $hi)))
+          (i32.store8 (i32.add (local.get $dst) (i32.const 2)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $lo) (i32.const 9))) (local.get $lo)))
+          (local.set $dst (i32.add (local.get $dst) (i32.const 3)))))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l))
     (local.get $dst))
+
+  ;; Copy $n bytes from $src to $dst if $dst+$n <= $lim; else return 0.
+  (func $put_lim (param $dst i32) (param $src i32) (param $n i32) (param $lim i32) (result i32)
+    (if (i32.eqz (local.get $dst)) (then (return (i32.const 0))))
+    (if (i32.gt_u (i32.add (local.get $dst) (local.get $n)) (local.get $lim))
+      (then (return (i32.const 0))))
+    (memory.copy (local.get $dst) (local.get $src) (local.get $n))
+    (i32.add (local.get $dst) (local.get $n)))
 
   ;; ======================= outgoing HTTP =======================
 
@@ -551,8 +577,10 @@
   (func $do_login (param $path i32) (param $len i32)
     (local $code_len i32) (local $redir_len i32) (local $id_len i32) (local $sec_len i32)
     (local $d i32) (local $st i32)
-    (local.set $code_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_code) (global.get $L_q_code) (i32.const 0x3000)))
-    (local.set $redir_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_redirect) (global.get $L_q_redirect) (i32.const 0x3400)))
+    ;; code @ 0x3000..0x3400 (1024), redirectUri @ 0x3400..0x3800 (1024). Caps stop
+    ;; smash into Origin @ 0x3800 / env cache @ 0xC000 (immortal under serial reuse).
+    (local.set $code_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_code) (global.get $L_q_code) (i32.const 0x3000) (i32.const 1024)))
+    (local.set $redir_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_redirect) (global.get $L_q_redirect) (i32.const 0x3400) (i32.const 1024)))
     (if (i32.or (i32.lt_s (local.get $code_len) (i32.const 0)) (i32.lt_s (local.get $redir_len) (i32.const 0)))
       (then (return (call $reply (i32.const 400) (global.get $S_badreq) (global.get $L_badreq) (i32.const 1)))))
     (call $ensure_env)
@@ -561,14 +589,18 @@
     (if (i32.or (i32.eqz (local.get $id_len)) (i32.eqz (local.get $sec_len)))
       (then (return (call $reply (i32.const 500) (global.get $S_err_env) (global.get $L_err_env) (i32.const 1)))))
 
-    (local.set $d (call $put (i32.const 0x2000) (global.get $S_f_code) (global.get $L_f_code)))
-    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3000) (local.get $code_len)))
-    (local.set $d (call $put (local.get $d) (global.get $S_f_redirect) (global.get $L_f_redirect)))
-    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3400) (local.get $redir_len)))
-    (local.set $d (call $put (local.get $d) (global.get $S_f_grant) (global.get $L_f_grant)))
-    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC000) (local.get $id_len)))
-    (local.set $d (call $put (local.get $d) (global.get $S_f_secret) (global.get $L_f_secret)))
-    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC200) (local.get $sec_len)))
+    ;; Form body lives in 0x2000..0x3000 only. Overflow here used to be able to
+    ;; clobber auth/origin/Patreon scratch and the immortal env secret slots.
+    (local.set $d (call $put_lim (i32.const 0x2000) (global.get $S_f_code) (global.get $L_f_code) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3000) (local.get $code_len) (i32.const 0x3000)))
+    (local.set $d (call $put_lim (local.get $d) (global.get $S_f_redirect) (global.get $L_f_redirect) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3400) (local.get $redir_len) (i32.const 0x3000)))
+    (local.set $d (call $put_lim (local.get $d) (global.get $S_f_grant) (global.get $L_f_grant) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC000) (local.get $id_len) (i32.const 0x3000)))
+    (local.set $d (call $put_lim (local.get $d) (global.get $S_f_secret) (global.get $L_f_secret) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC200) (local.get $sec_len) (i32.const 0x3000)))
+    (if (i32.eqz (local.get $d))
+      (then (return (call $reply (i32.const 400) (global.get $S_badreq) (global.get $L_badreq) (i32.const 1)))))
 
     (local.set $st (call $patreon_req (i32.const 2) (global.get $S_p_token) (global.get $L_p_token)
       (i32.const 0x2000) (i32.sub (local.get $d) (i32.const 0x2000)) (i32.const 1) (i32.const 0)))
