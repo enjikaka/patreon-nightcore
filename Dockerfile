@@ -43,4 +43,17 @@ COPY --from=build /src/nightcore-api.cwasm ./nightcore-api.cwasm
 USER nightcore
 ENV TOKIO_WORKER_THREADS=2 HOME=/tmp
 EXPOSE 8000
-ENTRYPOINT ["/usr/local/bin/wasmtime", "serve", "-S", "cli,inherit-env", "--allow-precompiled", "--addr", "0.0.0.0:8000", "/app/nightcore-api.cwasm"]
+# Concurrency safety: this guest keeps per-request state in process globals /
+# fixed scratch buffers ($r_*, $origin_*, $auth_*, 0x2000–0xC000). That is only
+# correct when at most one handle() runs per instance at a time.
+# WASIp2 already defaults to concurrent-reuse=1 (and cannot go higher); pin it
+# explicitly so a future wasmtime default change cannot silently race.
+# Serial reuse (>1) is OK with heap reset + immortal env cache, and is what
+# makes the env cache pay off across requests.
+ENTRYPOINT ["/usr/local/bin/wasmtime", "serve", \
+  "-S", "cli,inherit-env", \
+  "--allow-precompiled", \
+  "--max-instance-concurrent-reuse-count", "1", \
+  "--max-instance-reuse-count", "128", \
+  "--addr", "0.0.0.0:8000", \
+  "/app/nightcore-api.cwasm"]

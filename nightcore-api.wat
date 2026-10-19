@@ -208,6 +208,13 @@
   ;; Bump allocator cursor. Reset to 65536 at the start of every request.
   ;; Fixed buffers below 0xC000 (form/query/auth/origin/Patreon body) are immortal;
   ;; cached env secrets live at 0xC000/0xC200 so heap reset cannot clobber them.
+  ;;
+  ;; Concurrency: $heap, $origin_*, $auth_*, $r_*, $resp_len, and the fixed
+  ;; scratch regions are process-global. Overlapping handle() calls on the SAME
+  ;; instance would race. Production ENTRYPOINT pins
+  ;; --max-instance-concurrent-reuse-count=1 (WASIp2 default; cannot be >1 for
+  ;; p2). Serial reuse across requests is OK because heap is reset and env
+  ;; secrets live in immortal fixed slots.
   (global $heap (mut i32) (i32.const 65536))
   (global $origin_ptr (mut i32) (i32.const 0))
   (global $origin_len (mut i32) (i32.const 0))
