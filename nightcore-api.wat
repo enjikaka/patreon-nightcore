@@ -205,6 +205,16 @@
   (global $L_active i32 (i32.const 31))
 
   ;; ---- state ----
+  ;; Bump allocator cursor. Reset to 65536 at the start of every request.
+  ;; Fixed buffers below 0xC000 (form/query/auth/origin/Patreon body) are immortal;
+  ;; cached env secrets live at 0xC000/0xC200 so heap reset cannot clobber them.
+  ;;
+  ;; Concurrency: $heap, $origin_*, $auth_*, $r_*, $resp_len, and the fixed
+  ;; scratch regions are process-global. Overlapping handle() calls on the SAME
+  ;; instance would race. Production ENTRYPOINT pins
+  ;; --max-instance-concurrent-reuse-count=1 (WASIp2 default; cannot be >1 for
+  ;; p2). Serial reuse across requests is OK because heap is reset, request
+  ;; scratch is wiped at handle entry, and env secrets live in immortal slots.
   (global $heap (mut i32) (i32.const 65536))
   (global $origin_ptr (mut i32) (i32.const 0))
   (global $origin_len (mut i32) (i32.const 0))
@@ -212,6 +222,11 @@
   (global $auth_len (mut i32) (i32.const 0))
   (global $env_ptr (mut i32) (i32.const 0))
   (global $env_n (mut i32) (i32.const 0))
+  ;; One-shot env cache: PATREON_CLIENT_ID @ 0xC000, SECRET @ 0xC200 (max 512 each).
+  (global $env_ready (mut i32) (i32.const 0))
+  (global $cid_len (mut i32) (i32.const 0))
+  (global $csec_len (mut i32) (i32.const 0))
+  (global $mock_active (mut i32) (i32.const 0))
   (global $resp_len (mut i32) (i32.const 0))
   (global $r_status (mut i32) (i32.const 404))
   (global $r_ptr (mut i32) (i32.const 0))
@@ -316,14 +331,47 @@
         (br $l)))
     (i32.const 0) (i32.const 0))
 
+  ;; Lift process.env once, copy secrets into fixed immortal slots, then forget the
+  ;; bump-allocated env table (it will be overwritten when $heap resets next request).
+  (func $ensure_env
+    (local $ptr i32) (local $len i32)
+    (if (global.get $env_ready) (then (return)))
+    (call $get_environment (i32.const 0x108))
+    (global.set $env_ptr (i32.load (i32.const 0x108)))
+    (global.set $env_n (i32.load (i32.const 0x10c)))
+    (call $getenv (global.get $S_e_client_id) (global.get $L_e_client_id))
+    (local.set $len) (local.set $ptr)
+    (if (i32.and (i32.ne (local.get $ptr) (i32.const 0)) (i32.le_u (local.get $len) (i32.const 512)))
+      (then
+        (memory.copy (i32.const 0xC000) (local.get $ptr) (local.get $len))
+        (global.set $cid_len (local.get $len)))
+      (else (global.set $cid_len (i32.const 0))))
+    (call $getenv (global.get $S_e_client_secret) (global.get $L_e_client_secret))
+    (local.set $len) (local.set $ptr)
+    (if (i32.and (i32.ne (local.get $ptr) (i32.const 0)) (i32.le_u (local.get $len) (i32.const 512)))
+      (then
+        (memory.copy (i32.const 0xC200) (local.get $ptr) (local.get $len))
+        (global.set $csec_len (local.get $len)))
+      (else (global.set $csec_len (i32.const 0))))
+    (call $getenv (global.get $S_e_mock_active) (global.get $L_e_mock_active))
+    (local.set $len) (local.set $ptr)
+    (global.set $mock_active
+      (i32.and (i32.ne (local.get $ptr) (i32.const 0)) (i32.ne (local.get $len) (i32.const 0))))
+    (global.set $env_ptr (i32.const 0))
+    (global.set $env_n (i32.const 0))
+    (global.set $env_ready (i32.const 1)))
+
   (func $reply (param $status i32) (param $ptr i32) (param $len i32) (param $json i32)
     (global.set $r_status (local.get $status))
     (global.set $r_ptr (local.get $ptr))
     (global.set $r_len (local.get $len))
     (global.set $r_json (local.get $json)))
 
-  ;; Extract query parameter into decoded buffer. Returns decoded len, or -1 when absent/malformed.
-  (func $query_decode (param $path i32) (param $plen i32) (param $name i32) (param $nlen i32) (param $dst i32) (result i32)
+  ;; Extract query parameter into decoded buffer.
+  ;; Returns decoded len, or -1 when absent/malformed/exceeds $max.
+  ;; $max is required: unbounded decode could smash adjacent fixed slots
+  ;; (origin @ 0x3800, Patreon body @ 0x4000, env cache @ 0xC000) under /login.
+  (func $query_decode (param $path i32) (param $plen i32) (param $name i32) (param $nlen i32) (param $dst i32) (param $max i32) (result i32)
     (local $q i32) (local $p i32) (local $end i32) (local $ks i32) (local $ke i32) (local $vs i32) (local $ve i32) (local $d i32) (local $c i32) (local $h1 i32) (local $h2 i32)
     (local.set $end (i32.add (local.get $path) (local.get $plen)))
     (local.set $q (local.get $path))
@@ -364,6 +412,9 @@
           (local.set $p (local.get $vs))
           (loop $dec
             (if (i32.ge_u (local.get $p) (local.get $ve)) (then (return (i32.sub (local.get $d) (local.get $dst)))))
+            ;; Reject before writing when decoded output would exceed the slot.
+            (if (i32.ge_u (i32.sub (local.get $d) (local.get $dst)) (local.get $max))
+              (then (return (i32.const -1))))
             (local.set $c (i32.load8_u (local.get $p)))
             (if (i32.eq (local.get $c) (i32.const 0x2b))
               (then (i32.store8 (local.get $d) (i32.const 0x20)) (local.set $d (i32.add (local.get $d) (i32.const 1))) (local.set $p (i32.add (local.get $p) (i32.const 1))) (br $dec)))
@@ -393,8 +444,11 @@
       (br $params))
     (i32.const -1))
 
-  (func $form_enc (param $dst i32) (param $src i32) (param $len i32) (result i32)
-    (local $i i32) (local $c i32) (local $hi i32) (local $lo i32)
+  ;; URL-form-encode $src into $dst, never writing at or past $lim.
+  ;; Returns next dst, or 0 on overflow (callers must treat 0 as hard failure).
+  (func $form_enc (param $dst i32) (param $src i32) (param $len i32) (param $lim i32) (result i32)
+    (local $i i32) (local $c i32) (local $hi i32) (local $lo i32) (local $need i32)
+    (if (i32.eqz (local.get $dst)) (then (return (i32.const 0))))
     (loop $l
       (if (i32.ge_u (local.get $i) (local.get $len)) (then (return (local.get $dst))))
       (local.set $c (i32.load8_u (i32.add (local.get $src) (local.get $i))))
@@ -402,20 +456,37 @@
                          (i32.and (i32.ge_u (local.get $c) (i32.const 65)) (i32.le_u (local.get $c) (i32.const 90))))
                   (i32.or (i32.and (i32.ge_u (local.get $c) (i32.const 97)) (i32.le_u (local.get $c) (i32.const 122)))
                           (i32.or (i32.eq (local.get $c) (i32.const 45)) (i32.or (i32.eq (local.get $c) (i32.const 46)) (i32.or (i32.eq (local.get $c) (i32.const 95)) (i32.eq (local.get $c) (i32.const 42)))))))
-        (then (i32.store8 (local.get $dst) (local.get $c)) (local.set $dst (i32.add (local.get $dst) (i32.const 1))))
+        (then (local.set $need (i32.const 1)))
         (else
           (if (i32.eq (local.get $c) (i32.const 32))
-            (then (i32.store8 (local.get $dst) (i32.const 43)) (local.set $dst (i32.add (local.get $dst) (i32.const 1))))
-            (else
-              (local.set $hi (i32.shr_u (local.get $c) (i32.const 4)))
-              (local.set $lo (i32.and (local.get $c) (i32.const 15)))
-              (i32.store8 (local.get $dst) (i32.const 37))
-              (i32.store8 (i32.add (local.get $dst) (i32.const 1)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $hi) (i32.const 9))) (local.get $hi)))
-              (i32.store8 (i32.add (local.get $dst) (i32.const 2)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $lo) (i32.const 9))) (local.get $lo)))
-              (local.set $dst (i32.add (local.get $dst) (i32.const 3)))))))
+            (then (local.set $need (i32.const 1)))
+            (else (local.set $need (i32.const 3))))))
+      (if (i32.gt_u (i32.add (local.get $dst) (local.get $need)) (local.get $lim))
+        (then (return (i32.const 0))))
+      (if (i32.eq (local.get $need) (i32.const 1))
+        (then
+          (if (i32.eq (local.get $c) (i32.const 32))
+            (then (i32.store8 (local.get $dst) (i32.const 43)))
+            (else (i32.store8 (local.get $dst) (local.get $c))))
+          (local.set $dst (i32.add (local.get $dst) (i32.const 1))))
+        (else
+          (local.set $hi (i32.shr_u (local.get $c) (i32.const 4)))
+          (local.set $lo (i32.and (local.get $c) (i32.const 15)))
+          (i32.store8 (local.get $dst) (i32.const 37))
+          (i32.store8 (i32.add (local.get $dst) (i32.const 1)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $hi) (i32.const 9))) (local.get $hi)))
+          (i32.store8 (i32.add (local.get $dst) (i32.const 2)) (i32.add (select (i32.const 55) (i32.const 48) (i32.gt_u (local.get $lo) (i32.const 9))) (local.get $lo)))
+          (local.set $dst (i32.add (local.get $dst) (i32.const 3)))))
       (local.set $i (i32.add (local.get $i) (i32.const 1)))
       (br $l))
     (local.get $dst))
+
+  ;; Copy $n bytes from $src to $dst if $dst+$n <= $lim; else return 0.
+  (func $put_lim (param $dst i32) (param $src i32) (param $n i32) (param $lim i32) (result i32)
+    (if (i32.eqz (local.get $dst)) (then (return (i32.const 0))))
+    (if (i32.gt_u (i32.add (local.get $dst) (local.get $n)) (local.get $lim))
+      (then (return (i32.const 0))))
+    (memory.copy (local.get $dst) (local.get $src) (local.get $n))
+    (i32.add (local.get $dst) (local.get $n)))
 
   ;; ======================= outgoing HTTP =======================
 
@@ -436,7 +507,11 @@
         (call $fields_append (local.get $fields)
           (global.get $S_h_ct) (global.get $L_h_ct)
           (global.get $S_ct_form) (global.get $L_ct_form) (i32.const 0x40))))
-    (if (i32.and (local.get $auth) (i32.ne (global.get $auth_ptr) (i32.const 0)))
+    ;; Forward Authorization only when THIS request copied a non-empty value.
+    ;; Never trust leftover bytes in 0x3000 without both ptr and len set.
+    (if (i32.and (local.get $auth)
+          (i32.and (i32.ne (global.get $auth_ptr) (i32.const 0))
+                   (i32.ne (global.get $auth_len) (i32.const 0))))
       (then
         (call $fields_append (local.get $fields)
           (global.get $S_h_auth) (global.get $L_h_auth)
@@ -500,27 +575,32 @@
   ;; ======================= route handlers =======================
 
   (func $do_login (param $path i32) (param $len i32)
-    (local $code_len i32) (local $redir_len i32) (local $id_ptr i32) (local $id_len i32) (local $sec_ptr i32) (local $sec_len i32)
+    (local $code_len i32) (local $redir_len i32) (local $id_len i32) (local $sec_len i32)
     (local $d i32) (local $st i32)
-    (local.set $code_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_code) (global.get $L_q_code) (i32.const 0x3000)))
-    (local.set $redir_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_redirect) (global.get $L_q_redirect) (i32.const 0x3400)))
+    ;; code @ 0x3000..0x3400 (1024), redirectUri @ 0x3400..0x3800 (1024). Caps stop
+    ;; smash into Origin @ 0x3800 / env cache @ 0xC000 (immortal under serial reuse).
+    (local.set $code_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_code) (global.get $L_q_code) (i32.const 0x3000) (i32.const 1024)))
+    (local.set $redir_len (call $query_decode (local.get $path) (local.get $len) (global.get $S_q_redirect) (global.get $L_q_redirect) (i32.const 0x3400) (i32.const 1024)))
     (if (i32.or (i32.lt_s (local.get $code_len) (i32.const 0)) (i32.lt_s (local.get $redir_len) (i32.const 0)))
       (then (return (call $reply (i32.const 400) (global.get $S_badreq) (global.get $L_badreq) (i32.const 1)))))
-    (call $getenv (global.get $S_e_client_id) (global.get $L_e_client_id))
-    (local.set $id_len) (local.set $id_ptr)
-    (call $getenv (global.get $S_e_client_secret) (global.get $L_e_client_secret))
-    (local.set $sec_len) (local.set $sec_ptr)
-    (if (i32.or (i32.eqz (local.get $id_ptr)) (i32.eqz (local.get $sec_ptr)))
+    (call $ensure_env)
+    (local.set $id_len (global.get $cid_len))
+    (local.set $sec_len (global.get $csec_len))
+    (if (i32.or (i32.eqz (local.get $id_len)) (i32.eqz (local.get $sec_len)))
       (then (return (call $reply (i32.const 500) (global.get $S_err_env) (global.get $L_err_env) (i32.const 1)))))
 
-    (local.set $d (call $put (i32.const 0x2000) (global.get $S_f_code) (global.get $L_f_code)))
-    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3000) (local.get $code_len)))
-    (local.set $d (call $put (local.get $d) (global.get $S_f_redirect) (global.get $L_f_redirect)))
-    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3400) (local.get $redir_len)))
-    (local.set $d (call $put (local.get $d) (global.get $S_f_grant) (global.get $L_f_grant)))
-    (local.set $d (call $form_enc (local.get $d) (local.get $id_ptr) (local.get $id_len)))
-    (local.set $d (call $put (local.get $d) (global.get $S_f_secret) (global.get $L_f_secret)))
-    (local.set $d (call $form_enc (local.get $d) (local.get $sec_ptr) (local.get $sec_len)))
+    ;; Form body lives in 0x2000..0x3000 only. Overflow here used to be able to
+    ;; clobber auth/origin/Patreon scratch and the immortal env secret slots.
+    (local.set $d (call $put_lim (i32.const 0x2000) (global.get $S_f_code) (global.get $L_f_code) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3000) (local.get $code_len) (i32.const 0x3000)))
+    (local.set $d (call $put_lim (local.get $d) (global.get $S_f_redirect) (global.get $L_f_redirect) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0x3400) (local.get $redir_len) (i32.const 0x3000)))
+    (local.set $d (call $put_lim (local.get $d) (global.get $S_f_grant) (global.get $L_f_grant) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC000) (local.get $id_len) (i32.const 0x3000)))
+    (local.set $d (call $put_lim (local.get $d) (global.get $S_f_secret) (global.get $L_f_secret) (i32.const 0x3000)))
+    (local.set $d (call $form_enc (local.get $d) (i32.const 0xC200) (local.get $sec_len) (i32.const 0x3000)))
+    (if (i32.eqz (local.get $d))
+      (then (return (call $reply (i32.const 400) (global.get $S_badreq) (global.get $L_badreq) (i32.const 1)))))
 
     (local.set $st (call $patreon_req (i32.const 2) (global.get $S_p_token) (global.get $L_p_token)
       (i32.const 0x2000) (i32.sub (local.get $d) (i32.const 0x2000)) (i32.const 1) (i32.const 0)))
@@ -537,10 +617,9 @@
     (call $reply (local.get $st) (i32.const 0x4000) (global.get $resp_len) (i32.const 1)))
 
   (func $do_patron
-    (local $st i32) (local $mock_ptr i32) (local $mock_len i32)
-    (call $getenv (global.get $S_e_mock_active) (global.get $L_e_mock_active))
-    (local.set $mock_len) (local.set $mock_ptr)
-    (if (i32.and (i32.ne (local.get $mock_ptr) (i32.const 0)) (i32.ne (local.get $mock_len) (i32.const 0)))
+    (local $st i32)
+    (call $ensure_env)
+    (if (global.get $mock_active)
       (then (return (call $reply (i32.const 204) (i32.const 0) (i32.const 0) (i32.const 0)))))
     (local.set $st (call $patreon_req (i32.const 0) (global.get $S_p_patron) (global.get $L_p_patron)
       (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1)))
@@ -557,6 +636,25 @@
     (local $path i32) (local $len i32) (local $method i32)
     (local $resp i32) (local $fields i32) (local $body i32) (local $stream i32)
 
+    ;; Reclaim all bump-allocated ABI lifts from the previous request (path strings,
+    ;; header list temps, env table leftovers, Patreon body chunks, etc.).
+    (global.set $heap (i32.const 65536))
+
+    ;; Wipe request-scoped fixed scratch so a reused instance cannot retain the
+    ;; previous caller's Authorization, Origin, OAuth query, form body (includes
+    ;; client secret), or Patreon JSON. Env cache at 0xC000+ is intentionally kept.
+    ;; JS analogy: Object.assign(scratch, zeros) + reset length fields before parse.
+    (memory.fill (i32.const 0x2000) (i32.const 0) (i32.const 40960)) ;; 0x2000..0xC000
+    (global.set $origin_ptr (i32.const 0))
+    (global.set $origin_len (i32.const 0))
+    (global.set $auth_ptr (i32.const 0))
+    (global.set $auth_len (i32.const 0))
+    (global.set $resp_len (i32.const 0))
+    (global.set $r_status (i32.const 404))
+    (global.set $r_ptr (i32.const 0))
+    (global.set $r_len (i32.const 0))
+    (global.set $r_json (i32.const 0))
+
     (call $req_method (local.get $req) (i32.const 32))
     (local.set $method (i32.load8_u (i32.const 32)))
 
@@ -572,9 +670,7 @@
     (if (global.get $auth_len) (then (global.set $auth_ptr (i32.const 0x3000))) (else (global.set $auth_ptr (i32.const 0))))
     (call $req_drop (local.get $req))
 
-    (call $get_environment (i32.const 0x108))
-    (global.set $env_ptr (i32.load (i32.const 0x108)))
-    (global.set $env_n (i32.load (i32.const 0x10c)))
+    ;; Env is loaded lazily via $ensure_env from /login and /patron only.
 
     (call $reply (i32.const 404) (global.get $S_notfound) (global.get $L_notfound) (i32.const 0))
     (if (i32.eq (local.get $method) (i32.const 6))

@@ -29,7 +29,8 @@ RUN curl -fsSL https://github.com/WebAssembly/wasi-http/archive/refs/tags/v0.2.8
   && wasm-tools parse nightcore-api.wat -o nightcore-api.core.wasm \
   && wasm-tools component embed /tmp/wasi-http-0.2.8/wit nightcore-api.core.wasm \
       --world wasi:http/nightcore --emit-canonical-names -o nightcore-api.embed.wasm \
-  && wasm-tools component new nightcore-api.embed.wasm -o nightcore-api.wasm
+  && wasm-tools component new nightcore-api.embed.wasm -o nightcore-api.wasm \
+  && wasmtime compile -o nightcore-api.cwasm nightcore-api.wasm
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -38,8 +39,21 @@ RUN apt-get update \
   && useradd --system --no-create-home nightcore
 COPY --from=build /usr/local/bin/wasmtime /usr/local/bin/wasmtime
 WORKDIR /app
-COPY --from=build /src/nightcore-api.wasm ./nightcore-api.wasm
+COPY --from=build /src/nightcore-api.cwasm ./nightcore-api.cwasm
 USER nightcore
 ENV TOKIO_WORKER_THREADS=2 HOME=/tmp
 EXPOSE 8000
-ENTRYPOINT ["/usr/local/bin/wasmtime", "serve", "-S", "cli,inherit-env", "--addr", "0.0.0.0:8000", "/app/nightcore-api.wasm"]
+# Concurrency safety: this guest keeps per-request state in process globals /
+# fixed scratch buffers ($r_*, $origin_*, $auth_*, 0x2000–0xC000). That is only
+# correct when at most one handle() runs per instance at a time.
+# WASIp2 already defaults to concurrent-reuse=1 (and cannot go higher); pin it
+# explicitly so a future wasmtime default change cannot silently race.
+# Serial reuse (>1) is OK with heap reset + immortal env cache, and is what
+# makes the env cache pay off across requests.
+ENTRYPOINT ["/usr/local/bin/wasmtime", "serve", \
+  "-S", "cli,inherit-env", \
+  "--allow-precompiled", \
+  "--max-instance-concurrent-reuse-count", "1", \
+  "--max-instance-reuse-count", "128", \
+  "--addr", "0.0.0.0:8000", \
+  "/app/nightcore-api.cwasm"]
